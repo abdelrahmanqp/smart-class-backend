@@ -4,7 +4,7 @@ import { FaceMesh } from "@mediapipe/face_mesh";
 import { Camera } from "@mediapipe/camera_utils";
 import { drawLandmarks } from "@mediapipe/drawing_utils";
 
-const API = "http://localhost:5000";
+const API = "https://smart-class-backend-production.up.railway.app";
 const SUBJECTS = ["AI", "Database", "Software"];
 
 function usePollNotifications(role, enabled, onToast) {
