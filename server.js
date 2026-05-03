@@ -8,6 +8,8 @@ const PDFDocument = require("pdfkit");
 
 const app = express();
 
+app.set("trust proxy", 1);
+
 app.use(
     cors({
         origin: "*",
@@ -19,8 +21,7 @@ app.use(
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-const PORT = process.env.PORT || 5000;
-const HOST = process.env.HOST || `http://localhost:${PORT}`;
+const PORT = Number(process.env.PORT || 5000);
 
 const uploadsDir = path.join(__dirname, "uploads");
 const recordingsDir = path.join(__dirname, "recordings");
@@ -33,6 +34,14 @@ for (const dir of [uploadsDir, recordingsDir, summariesDir]) {
 app.use("/uploads", express.static(uploadsDir));
 app.use("/recordings", express.static(recordingsDir));
 app.use("/summaries", express.static(summariesDir));
+
+function getBaseUrl(req) {
+    const configured = process.env.PUBLIC_BASE_URL || process.env.PUBLIC_URL;
+    if (configured) return configured.replace(/\/+$/, "");
+    const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
+    const host = req.headers["x-forwarded-host"] || req.headers.host;
+    return `${proto}://${host}`.replace(/\/+$/, "");
+}
 
 const pool = mysql.createPool({
     host: process.env.DB_HOST || "127.0.0.1",
@@ -89,19 +98,6 @@ function reasonText(reason) {
     if (reason === "low_focus") return "Low focus for 15 seconds";
     if (reason === "camera_lost") return "Camera lost or face not detected";
     return reason || "Unknown";
-}
-
-function fileUrlToLocalPath(fileUrl, baseDir) {
-    if (!fileUrl) return null;
-
-    try {
-        const u = new URL(fileUrl);
-        const filename = decodeURIComponent(path.basename(u.pathname));
-        return path.join(baseDir, filename);
-    } catch {
-        const filename = decodeURIComponent(path.basename(String(fileUrl)));
-        return path.join(baseDir, filename);
-    }
 }
 
 async function initTables() {
@@ -308,16 +304,9 @@ function createSummaryPdf(summaryText, meta) {
     });
 }
 
-async function generateAutoSummaryForSession(live, sessionDbId) {
+async function generateAutoSummaryForSession(live, sessionDbId, baseUrl) {
     try {
         console.log("FORCE SUMMARY START");
-
-        const lecturePdfPath = fileUrlToLocalPath(live.pdf, uploadsDir);
-        let lectureText = "";
-
-        if (lecturePdfPath && fs.existsSync(lecturePdfPath)) {
-            lectureText = fs.readFileSync(lecturePdfPath, "utf8").toString();
-        }
 
         const summaryText = `
 Lecture Summary - ${live.subject}
@@ -334,13 +323,10 @@ Quick revision:
 
 Study tip:
 - Keep the summary open while revising to save time before exams.
-
-Reference note:
-- ${lectureText ? "Lecture file was processed and saved in the system." : "Lecture PDF stored successfully."}
 `;
 
         const createdPdf = await createSummaryPdf(summaryText, live);
-        const summaryUrl = `${HOST}/summaries/${createdPdf.filename}`;
+        const summaryUrl = `${baseUrl}/summaries/${createdPdf.filename}`;
 
         await dbQuery(
             `
@@ -363,6 +349,14 @@ Reference note:
         throw err;
     }
 }
+
+app.get("/", (_req, res) => {
+    res.json({ ok: true, service: "smart-class-backend" });
+});
+
+app.get("/health", (_req, res) => {
+    res.json({ ok: true });
+});
 
 app.get("/login", async (req, res) => {
     try {
@@ -449,7 +443,8 @@ app.post("/start-session", uploadPdf.single("pdf"), async (req, res) => {
             return res.status(400).json({ ok: false, error: "Missing session data" });
         }
 
-        const pdf = `${HOST}/uploads/${req.file.filename}`;
+        const baseUrl = getBaseUrl(req);
+        const pdf = `${baseUrl}/uploads/${req.file.filename}`;
 
         const session = {
             id: Date.now().toString(),
@@ -839,7 +834,8 @@ function finalizeSession(req, res) {
         return res.status(400).json({ ok: false, error: "No live session" });
     }
 
-    const recordingUrl = req.file ? `${HOST}/recordings/${req.file.filename}` : null;
+    const baseUrl = getBaseUrl(req);
+    const recordingUrl = req.file ? `${baseUrl}/recordings/${req.file.filename}` : null;
 
     dbQuery(
         "INSERT INTO sessions (doctor, subject, pdf, recording, started_at, ended_at) VALUES (?, ?, ?, ?, NOW(), NOW())",
@@ -849,7 +845,7 @@ function finalizeSession(req, res) {
             const sessionDbId = result?.insertId || null;
 
             try {
-                await generateAutoSummaryForSession(live, sessionDbId);
+                await generateAutoSummaryForSession(live, sessionDbId, baseUrl);
                 await notifyAll("Auto summary created", `${live.subject} summary was generated automatically`);
             } catch (err) {
                 console.log("AUTO SUMMARY ERROR:", err.message);
@@ -881,14 +877,26 @@ app.post("/end-session", (req, res) => {
     return finalizeSession(req, res);
 });
 
-initTables()
-    .then(ensureSchema)
-    .then(() => {
-        app.listen(PORT, () => {
-            console.log(`Server running on ${HOST}`);
+async function start() {
+    try {
+        await initTables();
+        await ensureSchema();
+
+        app.listen(PORT, "0.0.0.0", () => {
+            console.log(`Server running on port ${PORT}`);
         });
-    })
-    .catch((err) => {
+    } catch (err) {
         console.log("INIT TABLES ERROR:", err);
         process.exit(1);
-    });
+    }
+}
+
+process.on("unhandledRejection", (err) => {
+    console.log("UNHANDLED REJECTION:", err);
+});
+
+process.on("uncaughtException", (err) => {
+    console.log("UNCAUGHT EXCEPTION:", err);
+});
+
+start();

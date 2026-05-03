@@ -6,14 +6,15 @@
   "scripts": {
     "start": "node server.js"
   },
+  "keywords": [],
   "author": "Abdelrahman",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "multer": "^1.4.5-lts.1",
-    "mysql2": "^3.9.7",
-    "pdfkit": "^0.13.0"
+    "express": "^4.21.2",
+    "mysql2": "^3.14.5",
+    "multer": "^2.0.2",
+    "pdfkit": "^0.17.1"
   }
 }
