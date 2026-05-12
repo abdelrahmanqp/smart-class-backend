@@ -4,50 +4,32 @@ const mysql = require("mysql2/promise");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
-const PDFDocument = require("pdfkit");
+
+require("dotenv").config();
 
 const app = express();
 
-app.set("trust proxy", 1);
-
-app.use(
-    cors({
-        origin: "*",
-        methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        allowedHeaders: ["Content-Type", "Authorization"],
-    })
-);
-
+app.use(cors());
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-const PORT = Number(process.env.PORT || 5000);
+const PORT = process.env.PORT || 5000;
+const HOST = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 const uploadsDir = path.join(__dirname, "uploads");
 const recordingsDir = path.join(__dirname, "recordings");
-const summariesDir = path.join(__dirname, "summaries");
 
-for (const dir of [uploadsDir, recordingsDir, summariesDir]) {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+if (!fs.existsSync(recordingsDir)) fs.mkdirSync(recordingsDir, { recursive: true });
 
 app.use("/uploads", express.static(uploadsDir));
 app.use("/recordings", express.static(recordingsDir));
-app.use("/summaries", express.static(summariesDir));
-
-function getBaseUrl(req) {
-    const configured = process.env.PUBLIC_BASE_URL || process.env.PUBLIC_URL;
-    if (configured) return configured.replace(/\/+$/, "");
-    const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
-    const host = req.headers["x-forwarded-host"] || req.headers.host;
-    return `${proto}://${host}`.replace(/\/+$/, "");
-}
 
 const pool = mysql.createPool({
-    host: process.env.DB_HOST || "127.0.0.1",
-    user: process.env.DB_USER || "root",
-    password: process.env.DB_PASSWORD || "",
-    database: process.env.DB_NAME || "railway",
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
     port: Number(process.env.DB_PORT || 3306),
     waitForConnections: true,
     connectionLimit: 10,
@@ -83,14 +65,6 @@ function safeText(value) {
 
 function normalizeRole(value) {
     return safeText(value).toLowerCase();
-}
-
-function slugify(value) {
-    return safeText(value)
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-+|-+$/g, "")
-        .slice(0, 40) || "summary";
 }
 
 function reasonText(reason) {
@@ -138,18 +112,6 @@ async function initTables() {
       recording TEXT NULL,
       started_at DATETIME,
       ended_at DATETIME NULL
-    )
-  `);
-
-    await dbQuery(`
-    CREATE TABLE IF NOT EXISTS summaries (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      doctor VARCHAR(100),
-      subject VARCHAR(50),
-      title VARCHAR(255) NULL,
-      file TEXT,
-      session_id VARCHAR(100) NULL,
-      created_at DATETIME
     )
   `);
 
@@ -229,10 +191,6 @@ async function ensureSchema() {
     await addColumnIfMissing("sessions", "recording", "TEXT NULL");
     await addColumnIfMissing("sessions", "ended_at", "DATETIME NULL");
 
-    await addColumnIfMissing("summaries", "title", "VARCHAR(255) NULL");
-    await addColumnIfMissing("summaries", "session_id", "VARCHAR(100) NULL");
-    await addColumnIfMissing("summaries", "created_at", "DATETIME NULL");
-
     await addColumnIfMissing("attendance", "check_in_time", "DATETIME NULL");
     await addColumnIfMissing("attendance", "check_out_time", "DATETIME NULL");
     await addColumnIfMissing("attendance", "face_verified", "TINYINT DEFAULT 0");
@@ -274,96 +232,14 @@ function getLiveSession(subject) {
     return liveSessions[subject] || null;
 }
 
-function createSummaryPdf(summaryText, meta) {
-    return new Promise((resolve, reject) => {
-        const filename = `summary-${Date.now()}-${slugify(meta.subject)}.pdf`;
-        const filePath = path.join(summariesDir, filename);
-        const doc = new PDFDocument({ margin: 48, size: "A4" });
-        const stream = fs.createWriteStream(filePath);
-
-        stream.on("finish", () => resolve({ filename, filePath }));
-        stream.on("error", reject);
-        doc.on("error", reject);
-
-        doc.pipe(stream);
-
-        doc.fontSize(22).text("Lecture Summary", { align: "center" });
-        doc.moveDown(0.7);
-        doc.fontSize(11);
-        doc.text(`Subject: ${meta.subject}`);
-        doc.text(`Doctor: ${meta.doctor}`);
-        doc.text(`Generated at: ${new Date().toLocaleString()}`);
-        doc.moveDown(1);
-
-        const parts = String(summaryText || "").split("\n");
-        for (const part of parts) {
-            doc.fontSize(12).text(part || " ", { lineGap: 5 });
-        }
-
-        doc.end();
-    });
-}
-
-async function generateAutoSummaryForSession(live, sessionDbId, baseUrl) {
-    try {
-        console.log("FORCE SUMMARY START");
-
-        const summaryText = `
-Lecture Summary - ${live.subject}
-
-Main ideas:
-- The lecture was delivered by ${live.doctor}.
-- Students should review the lecture content after the session.
-- Focus on the key concepts, examples, and revision points.
-
-Quick revision:
-- Re-read the lecture PDF.
-- Revise the main definitions and notes.
-- Prepare for the next class by reviewing the important points.
-
-Study tip:
-- Keep the summary open while revising to save time before exams.
-`;
-
-        const createdPdf = await createSummaryPdf(summaryText, live);
-        const summaryUrl = `${baseUrl}/summaries/${createdPdf.filename}`;
-
-        await dbQuery(
-            `
-      INSERT INTO summaries (doctor, subject, title, file, session_id, created_at)
-      VALUES (?, ?, ?, ?, ?, NOW())
-      `,
-            [
-                live.doctor,
-                live.subject,
-                `Auto Summary - ${live.subject}`,
-                summaryUrl,
-                String(sessionDbId || live.id || ""),
-            ]
-        );
-
-        console.log("SUMMARY SAVED:", summaryUrl);
-        return summaryUrl;
-    } catch (err) {
-        console.log("SUMMARY ERROR:", err.message);
-        throw err;
-    }
-}
-
-app.get("/", (_req, res) => {
-    res.json({ ok: true, service: "smart-class-backend" });
-});
-
-app.get("/health", (_req, res) => {
-    res.json({ ok: true });
-});
-
 app.get("/login", async (req, res) => {
     try {
         const role = normalizeRole(req.query.role);
         const id = safeText(req.query.id);
         const email = safeText(req.query.email);
         const password = safeText(req.query.password);
+
+        console.log("LOGIN REQUEST:", { role, id, email, password });
 
         if (role === "teacher" || role === "doctor") {
             const rows = await dbQuery(
@@ -376,6 +252,7 @@ app.get("/login", async (req, res) => {
         `,
                 [email, password]
             );
+
             return res.json(rows.length ? { user: rows[0] } : {});
         }
 
@@ -390,6 +267,7 @@ app.get("/login", async (req, res) => {
         `,
                 [id, password]
             );
+
             return res.json(rows.length ? { user: rows[0] } : {});
         }
 
@@ -443,8 +321,7 @@ app.post("/start-session", uploadPdf.single("pdf"), async (req, res) => {
             return res.status(400).json({ ok: false, error: "Missing session data" });
         }
 
-        const baseUrl = getBaseUrl(req);
-        const pdf = `${baseUrl}/uploads/${req.file.filename}`;
+        const pdf = `${HOST}/uploads/${req.file.filename}`;
 
         const session = {
             id: Date.now().toString(),
@@ -497,19 +374,6 @@ app.get("/sessions/:subject", async (req, res) => {
         return res.json(rows || []);
     } catch (err) {
         console.log("SESSIONS ERROR:", err);
-        return res.status(500).json([]);
-    }
-});
-
-app.get("/summaries/:subject", async (req, res) => {
-    try {
-        const rows = await dbQuery(
-            "SELECT * FROM summaries WHERE subject=? ORDER BY id DESC",
-            [req.params.subject]
-        );
-        return res.json(rows || []);
-    } catch (err) {
-        console.log("SUMMARIES ERROR:", err);
         return res.status(500).json([]);
     }
 });
@@ -834,23 +698,13 @@ function finalizeSession(req, res) {
         return res.status(400).json({ ok: false, error: "No live session" });
     }
 
-    const baseUrl = getBaseUrl(req);
-    const recordingUrl = req.file ? `${baseUrl}/recordings/${req.file.filename}` : null;
+    const recordingUrl = req.file ? `${HOST}/recordings/${req.file.filename}` : null;
 
     dbQuery(
         "INSERT INTO sessions (doctor, subject, pdf, recording, started_at, ended_at) VALUES (?, ?, ?, ?, NOW(), NOW())",
         [live.doctor, live.subject, live.pdf, recordingUrl]
     )
-        .then(async (result) => {
-            const sessionDbId = result?.insertId || null;
-
-            try {
-                await generateAutoSummaryForSession(live, sessionDbId, baseUrl);
-                await notifyAll("Auto summary created", `${live.subject} summary was generated automatically`);
-            } catch (err) {
-                console.log("AUTO SUMMARY ERROR:", err.message);
-            }
-
+        .then(async () => {
             delete liveSessions[subject];
             await notifyAll("Session recorded", `${live.subject} has been saved`);
             return res.json({ ok: true, recording: recordingUrl });
@@ -877,26 +731,14 @@ app.post("/end-session", (req, res) => {
     return finalizeSession(req, res);
 });
 
-async function start() {
-    try {
-        await initTables();
-        await ensureSchema();
-
-        app.listen(PORT, "0.0.0.0", () => {
-            console.log(`Server running on port ${PORT}`);
+initTables()
+    .then(ensureSchema)
+    .then(() => {
+        app.listen(PORT, () => {
+            console.log(`Server running on ${HOST}`);
         });
-    } catch (err) {
+    })
+    .catch((err) => {
         console.log("INIT TABLES ERROR:", err);
         process.exit(1);
-    }
-}
-
-process.on("unhandledRejection", (err) => {
-    console.log("UNHANDLED REJECTION:", err);
-});
-
-process.on("uncaughtException", (err) => {
-    console.log("UNCAUGHT EXCEPTION:", err);
-});
-
-start();
+    });
